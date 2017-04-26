@@ -16,8 +16,38 @@ template <typename T>
 class shared_state {
 public:
     shared_state() : is_initialized_(false) { }
-    template <typename U>
+
+    template <typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
     void set_value(U&& v);
+
+    template <typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
+    void set_value();
+
+    void set_exception(std::exception_ptr e);
+
+    T get();
+    T try_get();
+    void wait();
+
+private:
+    bool is_initialized_;
+    std::exception_ptr error_;
+    std::unique_ptr<T> state_;
+    mutable std::mutex init_mutex_;
+    std::condition_variable init_cv_;
+};
+
+template <>
+class shared_state<void> {
+public:
+    shared_state() : is_initialized_(false) { }
+
+    template <typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
+    void set_value(U&& v);
+
+    template <typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
+    void set_value();
+
     void set_exception(std::exception_ptr e);
 
     T get();
@@ -60,8 +90,12 @@ public:
     promise& operator=(const promise& rhs) = delete;
     promise& operator=(promise&&) = default;
 
-    void set_value(T&& v);
-    void set_value(const T& v);
+    template <typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
+    void set_value(U&& v);
+
+    template <typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
+    void set_value();
+
     void set_exception(std::exception_ptr e);
 
     future<T> get_future();
@@ -78,7 +112,7 @@ private:
 class thread_pool {
 public:
     thread_pool(size_t);
-    template <typename F, typename... Args, bool async>
+    template <typename F, typename... Args>
     void run(F&& f, Args&&... args);
     ~thread_pool() = default;
 
@@ -86,19 +120,20 @@ private:
     std::vector<std::thread> workers_;
     std::mutex queue_mutex_;
 };
+/*
 
 template <bool try_async = false, typename F, typename... Args>
-auto async(F&& f, Args&&... args) -> future<std::result_of<F(Args...)>::type> {
-    using return_type = std::result_of<F(Args...)>::type;
+auto async(F&& f, Args&&... args) -> future<typename std::result_of<F(Args...)>::type> {
+    using return_type = typename std::result_of<F(Args...)>::type;
     auto p = promise<return_type>();
-    p.set_value(f(args));
+    p.set_value(f(args...));
     return p.get_feature();
 }
 
 
 template <bool try_async = true, typename F, typename... Args>
-auto async(F&& f, Args&&... args) -> future<std::result_of<F(Args...)>::type> {
-    using return_type = std::result_of<F(Args...)>::type;
+auto async(F&& f, Args&&... args) -> future<typename std::result_of<F(Args...)>::type> {
+    using return_type = typename std::result_of<F(Args...)>::type;
     std::shared_ptr<promise<return_type>> p;
     tp.run([=] {
         try {
@@ -109,13 +144,22 @@ auto async(F&& f, Args&&... args) -> future<std::result_of<F(Args...)>::type> {
     });
     return p->get_feature();
 }
+*/
 
 
 template <typename T>
-template <typename U>
+template <typename U, typename std::enable_if<!std::is_void<U>::value, int>::type>
 void shared_state<T>::set_value(U&& v) {
     std::lock_guard<std::mutex> lg(init_mutex_);
     state_ = std::make_unique<T>(std::forward<U>(v));
+    is_initialized_ = true;
+    init_cv_.notify_all();
+}
+
+template <>
+template <>
+void shared_state<void>::set_value() {
+    std::lock_guard<std::mutex> lg(init_mutex_);
     is_initialized_ = true;
     init_cv_.notify_all();
 }
@@ -152,13 +196,15 @@ T shared_state<T>::try_get() {
 }
 
 template <typename T>
-void promise<T>::set_value(T&& v) {
-    state_->set_value(std::move(v));
+template <typename U, typename std::enable_if<!std::is_void<U>::value, int>::type>
+void promise<T>::set_value(U&& v) {
+    state_->set_value(std::forward<U>(v));
 }
 
-template <typename T>
-void promise<T>::set_value(const T& v) {
-    state_->set_value(v);
+template <>
+template <>
+void promise<void>::set_value() {
+    state_->set_value();
 }
 
 template <typename T>
@@ -166,7 +212,7 @@ void promise<T>::set_exception(std::exception_ptr e) {
     state_->set_exception(e);
 }
 
-templatlambdae <typename T>
+template <typename T>
 future<T> promise<T>::get_future() {
     return future<T>(state_);
 }
