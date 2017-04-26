@@ -17,11 +17,8 @@ class shared_state {
 public:
     shared_state() : is_initialized_(false) { }
 
-    template <typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
+    template <typename U = T>
     void set_value(U&& v);
-
-    template <typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
-    void set_value();
 
     void set_exception(std::exception_ptr e);
 
@@ -42,22 +39,15 @@ class shared_state<void> {
 public:
     shared_state() : is_initialized_(false) { }
 
-    template <typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
-    void set_value(U&& v);
-
-    template <typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
     void set_value();
 
     void set_exception(std::exception_ptr e);
 
-    T get();
-    T try_get();
     void wait();
 
 private:
     bool is_initialized_;
     std::exception_ptr error_;
-    std::unique_ptr<T> state_;
     mutable std::mutex init_mutex_;
     std::condition_variable init_cv_;
 };
@@ -112,7 +102,7 @@ private:
 class thread_pool {
 public:
     thread_pool(size_t);
-    template <typename F, typename... Args>
+    template <bool try_async, typename F, typename... Args>
     void run(F&& f, Args&&... args);
     ~thread_pool() = default;
 
@@ -120,35 +110,39 @@ private:
     std::vector<std::thread> workers_;
     std::mutex queue_mutex_;
 };
-/*
 
-template <bool try_async = false, typename F, typename... Args>
-auto async(F&& f, Args&&... args) -> future<typename std::result_of<F(Args...)>::type> {
-    using return_type = typename std::result_of<F(Args...)>::type;
-    auto p = promise<return_type>();
-    p.set_value(f(args...));
-    return p.get_feature();
+template <typename F, typename... Args>
+using ReturnType = typename std::result_of<F(Args...)>::type;
+
+template <bool try_async, typename F, typename... Args, typename std::enable_if<std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
+auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
+    auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
+    tp.run<try_async>([=] {
+        try {
+            f(args...);
+            p->set_value();
+        } catch (...) {
+            p->set_exception(std::current_exception());
+        }
+    });
+    return p->get_future();
 }
 
-
-template <bool try_async = true, typename F, typename... Args>
-auto async(F&& f, Args&&... args) -> future<typename std::result_of<F(Args...)>::type> {
-    using return_type = typename std::result_of<F(Args...)>::type;
-    std::shared_ptr<promise<return_type>> p;
-    tp.run([=] {
+template <bool try_async, typename F, typename... Args, typename std::enable_if<!std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
+auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
+    auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
+    tp.run<try_async>([=] {
         try {
             p->set_value(f(args...));
         } catch (...) {
             p->set_exception(std::current_exception());
         }
     });
-    return p->get_feature();
+    return p->get_future();
 }
-*/
-
 
 template <typename T>
-template <typename U, typename std::enable_if<!std::is_void<U>::value, int>::type>
+template <typename U>
 void shared_state<T>::set_value(U&& v) {
     std::lock_guard<std::mutex> lg(init_mutex_);
     state_ = std::make_unique<T>(std::forward<U>(v));
@@ -156,8 +150,6 @@ void shared_state<T>::set_value(U&& v) {
     init_cv_.notify_all();
 }
 
-template <>
-template <>
 void shared_state<void>::set_value() {
     std::lock_guard<std::mutex> lg(init_mutex_);
     is_initialized_ = true;
@@ -172,8 +164,21 @@ void shared_state<T>::set_exception(std::exception_ptr e) {
     init_cv_.notify_all();
 }
 
+void shared_state<void>::set_exception(std::exception_ptr e) {
+    std::lock_guard<std::mutex> lg(init_mutex_);
+    error_ = e;
+    is_initialized_ = true;
+    init_cv_.notify_all();
+}
+
+
 template <typename T>
 void shared_state<T>::wait() {
+    std::unique_lock<std::mutex> lk(init_mutex_);
+    init_cv_.wait(lk, [this]{return is_initialized_;});
+}
+
+void shared_state<void>::wait() {
     std::unique_lock<std::mutex> lk(init_mutex_);
     init_cv_.wait(lk, [this]{return is_initialized_;});
 }
