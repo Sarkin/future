@@ -102,42 +102,61 @@ private:
 class thread_pool {
 public:
     thread_pool(size_t);
-    template <bool try_async, typename F, typename... Args>
+
+    template <bool try_async, typename F, typename... Args, typename std::enable_if<try_async, int>::type = 0>
     void run(F&& f, Args&&... args);
-    ~thread_pool() = default;
+
+    template <bool try_async, typename F, typename... Args, typename std::enable_if<!try_async, int>::type = 0>
+    void run(F&& f, Args&&... args);
+
+    ~thread_pool();
+
+    thread_pool(const thread_pool& rhs) = delete;
+    thread_pool(thread_pool&&) = delete;
+    thread_pool& operator=(const thread_pool& rhs) = delete;
+    thread_pool& operator=(thread_pool&&) = delete;
 
 private:
+    size_t num_available_;
+    bool stop_;
     std::vector<std::thread> workers_;
-    std::mutex queue_mutex_;
-};
+    std::queue<std::function<void()>> tasks_;
+    std::condition_variable cv_;
+    std::mutex mutex_;
+} tp(3);
 
 template <typename F, typename... Args>
 using ReturnType = typename std::result_of<F(Args...)>::type;
 
+template <typename ...T>
+class TD;
+
+
 template <bool try_async, typename F, typename... Args, typename std::enable_if<std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
 auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
     auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
-    tp.run<try_async>([=] {
+    auto run = [p](auto&& f, auto&&... args) {
         try {
-            f(args...);
+            f(std::forward<decltype(args)>(args)...);
             p->set_value();
         } catch (...) {
             p->set_exception(std::current_exception());
         }
-    });
+    };
+    tp.run<try_async>(std::move(run), std::forward<F>(f), std::forward<Args>(args)...);
     return p->get_future();
 }
 
 template <bool try_async, typename F, typename... Args, typename std::enable_if<!std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
 auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
     auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
-    tp.run<try_async>([=] {
+    tp.run<try_async>([p](auto&& f, auto&&... args) {
         try {
-            p->set_value(f(args...));
+            p->set_value(f(std::forward<decltype(args)>(args)...));
         } catch (...) {
             p->set_exception(std::current_exception());
         }
-    });
+    }, std::forward<F>(f), std::forward<Args>(args)...);
     return p->get_future();
 }
 
@@ -235,6 +254,66 @@ T future<T>::try_get() {
 template <typename T>
 void future<T>::wait() {
     return state_->wait();
+}
+
+thread_pool::thread_pool(size_t n_threads) : num_available_(0), stop_(false) {
+    for (int i = 0; i < n_threads; i++) {
+        workers_.emplace_back(
+            [this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(this->mutex_);
+                        num_available_++;
+                        this->cv_.wait(lk, [this] { return !this->tasks_.empty() || this->stop_; });
+                        if (this->stop_) {
+                            return;
+                        }
+                        task = std::move(this->tasks_.front());
+                        this->tasks_.pop();
+                    }
+                    task();
+                }
+            }
+        );
+    }
+}
+
+thread_pool::~thread_pool() {
+    {
+        std::lock_guard<std::mutex> lg(mutex_);
+        stop_ = true;
+        cv_.notify_all();
+    }
+    for (auto& thread : workers_) {
+        thread.join();
+    }
+}
+
+template <bool try_async, typename F, typename... Args, typename std::enable_if<try_async, int>::type>
+void thread_pool::run(F&& f, Args&&... args) {
+    bool run_sync = true;
+    {
+        std::lock_guard<std::mutex> lg(mutex_);
+        if  (num_available_ > 0) {
+            num_available_--;
+            tasks_.emplace(
+                [&f, &args...] {
+                    f(std::forward<Args>(args)...);
+                }
+            );
+            cv_.notify_one();
+        }
+        run_sync = false;
+    }
+    if (run_sync) {
+        run<false>(std::forward<F>(f), std::forward<Args>(args)...);
+    }
+}
+
+template <bool try_async, typename F, typename... Args, typename std::enable_if<!try_async, int>::type>
+void thread_pool::run(F&& f, Args&&... args) {
+    f(std::forward<Args>(args)...);
 }
 
 /*
