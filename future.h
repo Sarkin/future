@@ -194,12 +194,12 @@ void shared_state<void>::set_exception(std::exception_ptr e) {
 template <typename T>
 void shared_state<T>::wait() {
     std::unique_lock<std::mutex> lk(init_mutex_);
-    init_cv_.wait(lk, [this]{return is_initialized_;});
+    init_cv_.wait(lk, [this]{ return is_initialized_; });
 }
 
 void shared_state<void>::wait() {
     std::unique_lock<std::mutex> lk(init_mutex_);
-    init_cv_.wait(lk, [this]{return is_initialized_;});
+    init_cv_.wait(lk, [this]{ return is_initialized_; });
 }
 
 template <typename T>
@@ -297,14 +297,15 @@ void thread_pool::run(F&& f, Args&&... args) {
         std::lock_guard<std::mutex> lg(mutex_);
         if  (num_available_ > 0) {
             num_available_--;
+            auto b = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
             tasks_.emplace(
-                [&f, &args...] {
-                    f(std::forward<Args>(args)...);
+                [mb = std::move(b)] {
+                    mb();
                 }
             );
             cv_.notify_one();
+            run_sync = false;
         }
-        run_sync = false;
     }
     if (run_sync) {
         run<false>(std::forward<F>(f), std::forward<Args>(args)...);
