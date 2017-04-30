@@ -12,6 +12,9 @@
 
 namespace kinan {
 
+template <typename F, typename... Args>
+using ReturnType = typename std::result_of<F(Args...)>::type;
+
 template <typename T>
 class shared_state {
 public:
@@ -66,6 +69,12 @@ public:
     T try_get();
     void wait();
 
+    template <typename F, typename U = T, typename std::enable_if<!std::is_void<U>::value, int>::type = 0>
+    future<ReturnType<F, T>> then(F&& f);
+
+    template <typename F, typename U = T, typename std::enable_if<std::is_void<U>::value, int>::type = 0>
+    future<ReturnType<F, T>> then(F&& f);
+
 private:
     std::shared_ptr<shared_state<T>> state_;
 };
@@ -89,11 +98,6 @@ public:
     void set_exception(std::exception_ptr e);
 
     future<T> get_future();
-
-    /*
-    template <typename U>
-    future<T> then(future<U> f);
-    */
 
 private:
     std::shared_ptr<shared_state<T>> state_;
@@ -123,17 +127,15 @@ private:
     std::queue<std::function<void()>> tasks_;
     std::condition_variable cv_;
     std::mutex mutex_;
-} tp(3);
-
-template <typename F, typename... Args>
-using ReturnType = typename std::result_of<F(Args...)>::type;
+} k_thread_pool(3);
 
 template <typename ...T>
 class TD;
 
 
+// Perhaps it's better to write async as a function object and make the thread_pool a static member.
 template <bool try_async, typename F, typename... Args, typename std::enable_if<std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
-auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
+future<ReturnType<F, Args...>> async(F&& f, Args&&... args) {
     auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
     auto run = [p](auto&& f, auto&&... args) {
         try {
@@ -143,14 +145,14 @@ auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
             p->set_exception(std::current_exception());
         }
     };
-    tp.run<try_async>(std::move(run), std::forward<F>(f), std::forward<Args>(args)...);
+    k_thread_pool.run<try_async>(std::move(run), std::forward<F>(f), std::forward<Args>(args)...);
     return p->get_future();
 }
 
 template <bool try_async, typename F, typename... Args, typename std::enable_if<!std::is_void<ReturnType<F, Args...>>::value, int>::type = 0>
-auto async(F&& f, Args&&... args) -> future<ReturnType<F, Args...>> {
+future<ReturnType<F, Args...>> async(F&& f, Args&&... args) {
     auto p = std::make_shared<promise<ReturnType<F, Args...>>>();
-    tp.run<try_async>([p](auto&& f, auto&&... args) {
+    k_thread_pool.run<try_async>([p](auto&& f, auto&&... args) {
         try {
             p->set_value(f(std::forward<decltype(args)>(args)...));
         } catch (...) {
@@ -317,11 +319,23 @@ void thread_pool::run(F&& f, Args&&... args) {
     f(std::forward<Args>(args)...);
 }
 
-/*
 template <typename T>
-template <typename U>
-future<T> future<T>::then(future<U> f) {
+template <typename F, typename U, typename std::enable_if<std::is_void<U>::value, int>::type>
+future<ReturnType<F, T>> future<T>::then(F&& f) {
+    return async<true>(
+        [this](auto&& f) {
+            this->wait();
+            return f();
+        }, std::forward<F>(f));
 }
-*/
+
+template <typename T>
+template <typename F, typename U, typename std::enable_if<!std::is_void<U>::value, int>::type>
+future<ReturnType<F, T>> future<T>::then(F&& f) {
+    return async<true>(
+        [this](auto&& f) {
+            return f(this->get());
+        }, std::forward<F>(f));
+}
 
 } // namespace kinan
